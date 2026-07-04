@@ -2,96 +2,99 @@ const express = require("express");
 
 const app = express();
 const cache = new Map();
-const CACHE_MS = 120000;
-
-const MANUAL_ITEMS = {
-  users: {
-    // Example:
-    // "145772": {
-    //   items: [
-    //     { id: 123456789, name: "10 Robux", price: 10, assetType: "Gamepass" }
-    //   ]
-    // }
-  }
-};
+const CACHE_MS = 2 * 60 * 1000;
 
 app.use(express.json({ limit: "1mb" }));
 
-function cacheGet(key) {
-  const item = cache.get(key);
-  if (!item) return null;
-  if (Date.now() - item.time > CACHE_MS) {
+function getFromCache(key) {
+  const cached = cache.get(key);
+  if (!cached) return null;
+
+  if (Date.now() - cached.time > CACHE_MS) {
     cache.delete(key);
     return null;
   }
-  return item.value;
+
+  return cached.value;
 }
 
-function cacheSet(key, value) {
-  cache.set(key, { time: Date.now(), value });
+function setCache(key, value) {
+  cache.set(key, {
+    time: Date.now(),
+    value
+  });
 }
 
-async function getJson(url) {
+async function fetchJson(url, debug, label) {
   const response = await fetch(url, {
     headers: {
-      "User-Agent": "MAINTIPS-Roblox-Proxy/1.0",
-      "Accept": "application/json"
+      "Accept": "application/json",
+      "User-Agent": "MAINTIPS-Auto-Booth/1.0"
     }
   });
 
   if (!response.ok) {
-    throw new Error("HTTP " + response.status + " from " + url);
+    throw new Error(label + " HTTP " + response.status);
   }
 
   return response.json();
 }
 
-async function getJsonFirst(urls, debug, label) {
+async function fetchFirst(urls, debug, label) {
   let lastError = null;
 
   for (const url of urls) {
     try {
-      const data = await getJson(url);
-      if (debug) {
-        debug.steps.push({ label, url, ok: true });
-      }
+      const data = await fetchJson(url, debug, label);
+      debug.steps.push({ label, ok: true, url });
       return data;
     } catch (error) {
       lastError = error;
-      if (debug) {
-        debug.steps.push({ label, url, ok: false, error: error.message });
-      }
+      debug.steps.push({ label, ok: false, url, error: error.message });
     }
   }
 
-  throw lastError || new Error("All URLs failed for " + label);
+  throw lastError || new Error(label + " failed");
 }
 
-function normalizeAssetType(assetTypeId) {
-  if (assetTypeId === 2) return "TShirt";
-  if (assetTypeId === 11) return "Shirt";
-  if (assetTypeId === 12) return "Pants";
+function assetTypeName(assetTypeId) {
+  const id = Number(assetTypeId);
+  if (id === 2) return "TShirt";
+  if (id === 11) return "Shirt";
+  if (id === 12) return "Pants";
   return null;
 }
 
-function addUnique(items, seen, item) {
-  if (!item || !item.id || seen[item.id]) return;
-  if (!item.price || item.price <= 0) return;
-  seen[item.id] = true;
-  items.push(item);
+function addItem(items, seen, item) {
+  if (!item) return;
+
+  const id = Number(item.id);
+  const price = Number(item.price);
+  const assetType = String(item.assetType || "");
+
+  if (!id || !price || price <= 0 || !assetType) return;
+  if (seen[id]) return;
+
+  seen[id] = true;
+  items.push({
+    id,
+    name: String(item.name || assetType),
+    price,
+    assetType
+  });
 }
 
 async function getUser(userId, debug) {
-  const encoded = encodeURIComponent(userId);
-  const data = await getJsonFirst([
-    "https://users.roblox.com/v1/users/" + encoded,
-    "https://users.roproxy.com/v1/users/" + encoded
+  const id = encodeURIComponent(String(userId));
+  const data = await fetchFirst([
+    "https://users.roblox.com/v1/users/" + id,
+    "https://users.roproxy.com/v1/users/" + id
   ], debug, "user");
 
   return {
-    id: data.id || Number(userId),
-    name: data.name || String(userId),
-    displayName: data.displayName || data.name || String(userId)
+    id: Number(data.id || userId),
+    name: String(data.name || userId),
+    displayName: String(data.displayName || data.name || userId)
   };
 }
 
@@ -103,22 +106,22 @@ async function getUserGames(userId, debug) {
   for (const filter of filters) {
     let cursor = "";
 
-    for (let page = 0; page < 3; page++) {
-      let path = "/v2/users/" + encodeURIComponent(userId)
-        + "/games?accessFilter=" + filter
+    for (let page = 0; page < 5; page++) {
+      let path = "/v2/users/" + encodeURIComponent(String(userId))
+        + "/games?accessFilter=" + encodeURIComponent(filter)
         + "&sortOrder=Asc&limit=50";
 
-      if (cursor) path += "&cursor=" + encodeURIComponent(cursor);
+      if (cursor) {
+        path += "&cursor=" + encodeURIComponent(cursor);
+      }
 
-      const data = await getJsonFirst([
+      const data = await fetchFirst([
         "https://games.roblox.com" + path,
         "https://games.roproxy.com" + path
-      ], debug, "games");
+      ], debug, "user-games");
 
-      const list = data.data || [];
-
-      for (const game of list) {
-        const universeId = game.id || game.universeId;
+      for (const game of data.data || []) {
+        const universeId = Number(game.id || game.universeId);
         if (universeId && !seen[universeId]) {
           seen[universeId] = true;
           games.push(universeId);
@@ -132,164 +135,172 @@ async function getUserGames(userId, debug) {
     if (games.length > 0) break;
   }
 
+  debug.gamesFound = games.length;
   return games;
 }
 
-async function getGamepasses(universeId, debug) {
-  const items = [];
+async function getGamepassesForUniverse(universeId, debug) {
+  const result = [];
   let cursor = "";
 
-  for (let page = 0; page < 3; page++) {
-    let path = "/v1/games/" + encodeURIComponent(universeId)
+  for (let page = 0; page < 5; page++) {
+    let path = "/v1/games/" + encodeURIComponent(String(universeId))
       + "/game-passes?limit=100&sortOrder=Asc";
 
-    if (cursor) path += "&cursor=" + encodeURIComponent(cursor);
+    if (cursor) {
+      path += "&cursor=" + encodeURIComponent(cursor);
+    }
 
-    const data = await getJsonFirst([
+    const data = await fetchFirst([
       "https://games.roblox.com" + path,
       "https://games.roproxy.com" + path
-    ], debug, "gamepasses");
+    ], debug, "game-passes");
 
-    const list = data.data || [];
-
-    for (const pass of list) {
-      if (pass.id && pass.price) {
-        items.push({
-          id: pass.id,
-          name: pass.name || "Gamepass",
-          price: pass.price,
-          assetType: "Gamepass"
-        });
-      }
+    for (const pass of data.data || []) {
+      result.push({
+        id: pass.id,
+        name: pass.name || "Gamepass",
+        price: pass.price,
+        assetType: "Gamepass"
+      });
     }
 
     cursor = data.nextPageCursor;
     if (!cursor) break;
   }
 
-  return items;
+  return result;
 }
 
 async function getProductInfo(assetId, debug) {
-  const encoded = encodeURIComponent(assetId);
-  return getJsonFirst([
-    "https://api.roblox.com/marketplace/productinfo?assetId=" + encoded,
-    "https://api.roproxy.com/marketplace/productinfo?assetId=" + encoded
-  ], debug, "productinfo");
+  const id = encodeURIComponent(String(assetId));
+  return fetchFirst([
+    "https://api.roblox.com/marketplace/productinfo?assetId=" + id,
+    "https://api.roproxy.com/marketplace/productinfo?assetId=" + id
+  ], debug, "product-info");
 }
 
-async function getCatalogItems(username, debug) {
-  const items = [];
-  const path = "/v1/search/items"
-    + "?creatorName=" + encodeURIComponent(username)
-    + "&creatorType=User"
-    + "&salesTypeFilter=1"
-    + "&limit=100";
+async function getClothingByCreator(username, debug) {
+  const result = [];
+  const creator = encodeURIComponent(username);
 
-  const data = await getJsonFirst([
-    "https://catalog.roblox.com" + path,
-    "https://catalog.roproxy.com" + path
-  ], debug, "catalog");
+  const urls = [
+    "https://catalog.roblox.com/v1/search/items?category=Clothing&creatorName=" + creator + "&creatorType=User&salesTypeFilter=1&limit=100",
+    "https://catalog.roblox.com/v1/search/items?Category=3&CreatorName=" + creator + "&CreatorType=User&SalesTypeFilter=1&Limit=100",
+    "https://catalog.roproxy.com/v1/search/items?category=Clothing&creatorName=" + creator + "&creatorType=User&salesTypeFilter=1&limit=100",
+    "https://catalog.roproxy.com/v1/search/items?Category=3&CreatorName=" + creator + "&CreatorType=User&SalesTypeFilter=1&Limit=100"
+  ];
 
-  const list = data.data || [];
-
-  for (const item of list) {
-    const assetType = normalizeAssetType(item.assetType || item.assetTypeId);
-    if (assetType && item.id && item.price) {
-      items.push({
-        id: item.id,
-        name: item.name || assetType,
-        price: item.price,
-        assetType
-      });
-    } else if (item.id) {
-      try {
-        const info = await getProductInfo(item.id, debug);
-        const detailedType = normalizeAssetType(info.AssetTypeId || info.assetTypeId);
-        const price = info.PriceInRobux || info.price;
-        if (detailedType && price) {
-          items.push({
-            id: info.AssetId || item.id,
-            name: info.Name || item.name || detailedType,
-            price,
-            assetType: detailedType
-          });
-        }
-      } catch (error) {
-        if (debug) {
-          debug.steps.push({ label: "productinfo-skip", id: item.id, ok: false, error: error.message });
-        }
-      }
+  let data = null;
+  for (const url of urls) {
+    try {
+      data = await fetchJson(url, debug, "catalog");
+      debug.steps.push({ label: "catalog", ok: true, url });
+      break;
+    } catch (error) {
+      debug.steps.push({ label: "catalog", ok: false, url, error: error.message });
     }
   }
 
-  return items;
-}
+  if (!data || !data.data) {
+    debug.clothingFound = 0;
+    return result;
+  }
 
-function getManualItems(userId, username) {
-  const lists = [];
-  const userKey = String(userId);
+  for (const item of data.data) {
+    const directType = assetTypeName(item.assetType || item.assetTypeId);
+    const directPrice = Number(item.price || item.lowestPrice || 0);
 
-  if (MANUAL_ITEMS.users[userKey]) lists.push(MANUAL_ITEMS.users[userKey]);
-  if (username && MANUAL_ITEMS.users[username]) lists.push(MANUAL_ITEMS.users[username]);
+    if (item.id && directType && directPrice > 0) {
+      result.push({
+        id: item.id,
+        name: item.name || directType,
+        price: directPrice,
+        assetType: directType
+      });
+      continue;
+    }
 
-  const items = [];
-  for (const list of lists) {
-    for (const item of (list.items || [])) {
-      if (item.id && item.price && item.assetType) {
-        items.push({
-          id: Number(item.id),
-          name: String(item.name || item.assetType),
-          price: Number(item.price),
-          assetType: String(item.assetType)
+    if (!item.id) continue;
+
+    try {
+      const info = await getProductInfo(item.id, debug);
+      const detailedType = assetTypeName(info.AssetTypeId || info.assetTypeId);
+      const detailedPrice = Number(info.PriceInRobux || info.price || 0);
+
+      if (detailedType && detailedPrice > 0 && info.IsForSale !== false) {
+        result.push({
+          id: info.AssetId || item.id,
+          name: info.Name || item.name || detailedType,
+          price: detailedPrice,
+          assetType: detailedType
         });
       }
+    } catch (error) {
+      debug.steps.push({
+        label: "product-info-skip",
+        ok: false,
+        id: item.id,
+        error: error.message
+      });
     }
   }
-  return items;
+
+  debug.clothingFound = result.length;
+  return result;
 }
 
-async function buildDonationItems(userId, withDebug = false) {
-  const cacheKey = "items:" + userId;
-  const cached = cacheGet(cacheKey);
-  if (cached && !withDebug) return cached;
+async function buildItems(userId, debugMode) {
+  const cacheKey = "user:" + userId;
+  const cached = getFromCache(cacheKey);
+  if (cached && !debugMode) return cached;
 
-  const debug = { steps: [] };
+  const debug = {
+    userId: Number(userId),
+    steps: [],
+    gamesFound: 0,
+    gamepassesFound: 0,
+    clothingFound: 0
+  };
+
   const user = await getUser(userId, debug);
   const items = [];
   const seen = {};
 
   try {
     const games = await getUserGames(user.id, debug);
-    debug.gamesFound = games.length;
 
     for (const universeId of games) {
-      const passes = await getGamepasses(universeId, debug);
-      for (const item of passes) addUnique(items, seen, item);
+      try {
+        const passes = await getGamepassesForUniverse(universeId, debug);
+        debug.gamepassesFound += passes.length;
+        for (const pass of passes) {
+          addItem(items, seen, pass);
+        }
+      } catch (error) {
+        debug.steps.push({
+          label: "game-passes-universe-failed",
+          ok: false,
+          universeId,
+          error: error.message
+        });
+      }
     }
   } catch (error) {
-    console.warn("[passes]", error.message);
-    debug.passesError = error.message;
+    debug.steps.push({ label: "all-game-passes-failed", ok: false, error: error.message });
   }
 
   try {
-    const clothes = await getCatalogItems(user.name, debug);
-    debug.clothingFound = clothes.length;
-
-    for (const item of clothes) addUnique(items, seen, item);
+    const clothing = await getClothingByCreator(user.name, debug);
+    for (const item of clothing) {
+      addItem(items, seen, item);
+    }
   } catch (error) {
-    console.warn("[catalog]", error.message);
-    debug.catalogError = error.message;
-  }
-
-  const manual = getManualItems(user.id, user.name);
-  debug.manualFound = manual.length;
-  for (const item of manual) {
-    addUnique(items, seen, item);
+    debug.steps.push({ label: "all-clothing-failed", ok: false, error: error.message });
   }
 
   items.sort((a, b) => {
-    if (a.price === b.price) return String(a.name).localeCompare(String(b.name));
+    if (a.price === b.price) return a.name.localeCompare(b.name);
     return a.price - b.price;
   });
 
@@ -301,17 +312,17 @@ async function buildDonationItems(userId, withDebug = false) {
     items
   };
 
-  if (withDebug) {
+  if (debugMode) {
     result.debug = debug;
   } else {
-    cacheSet(cacheKey, result);
+    setCache(cacheKey, result);
   }
 
   return result;
 }
 
 app.get("/", (req, res) => {
-  res.type("text/plain").send("MAINTIPS proxy is running");
+  res.type("text/plain").send("MAINTIPS auto booth proxy is running");
 });
 
 app.get("/health", (req, res) => {
@@ -320,7 +331,7 @@ app.get("/health", (req, res) => {
 
 app.get("/items/:userId", async (req, res) => {
   try {
-    const result = await buildDonationItems(req.params.userId);
+    const result = await buildItems(req.params.userId, false);
     res.json(result);
   } catch (error) {
     res.status(500).json({
@@ -333,7 +344,7 @@ app.get("/items/:userId", async (req, res) => {
 
 app.get("/debug/:userId", async (req, res) => {
   try {
-    const result = await buildDonationItems(req.params.userId, true);
+    const result = await buildItems(req.params.userId, true);
     res.json(result);
   } catch (error) {
     res.status(500).json({
@@ -344,28 +355,7 @@ app.get("/debug/:userId", async (req, res) => {
   }
 });
 
-app.get("/donate_items.json", async (req, res) => {
-  const userId = req.query.userId || req.query.userid;
-  if (!userId) {
-    res.json({ users: {} });
-    return;
-  }
-
-  try {
-    const result = await buildDonationItems(userId);
-    res.json({
-      users: {
-        [String(userId)]: {
-          items: result.items
-        }
-      }
-    });
-  } catch (error) {
-    res.status(500).json({ users: {}, error: error.message });
-  }
-});
-
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
-  console.log("MAINTIPS proxy running on port " + port);
+  console.log("MAINTIPS auto booth proxy running on port " + port);
 });
