@@ -4,298 +4,313 @@ const app = express();
 const cache = new Map();
 const CACHE_MS = 2 * 60 * 1000;
 
+// Change this if your Korone/Pekora domain is different.
+// No Roblox or roproxy domains are used in this server.
+const PEKORA_BASE_URL = process.env.PEKORA_BASE_URL || "https://pekora.zip";
+
 app.use(express.json({ limit: "1mb" }));
 
-function getFromCache(key) {
-  const cached = cache.get(key);
-  if (!cached) return null;
+function joinUrl(base, path) {
+  return base.replace(/\/+$/, "") + "/" + String(path).replace(/^\/+/, "");
+}
 
-  if (Date.now() - cached.time > CACHE_MS) {
+function cacheGet(key) {
+  const hit = cache.get(key);
+  if (!hit) return null;
+  if (Date.now() - hit.time > CACHE_MS) {
     cache.delete(key);
     return null;
   }
-
-  return cached.value;
+  return hit.value;
 }
 
-function setCache(key, value) {
-  cache.set(key, {
-    time: Date.now(),
-    value
-  });
+function cacheSet(key, value) {
+  cache.set(key, { time: Date.now(), value });
 }
 
-async function fetchJson(url, debug, label) {
+async function fetchText(url) {
   const response = await fetch(url, {
     headers: {
-      "Accept": "application/json",
-      "User-Agent": "MAINTIPS-Auto-Booth/1.0"
+      "Accept": "application/json,text/html,*/*",
+      "User-Agent": "Mozilla/5.0 MAINTIPS-Pekora-Booth/1.0"
     }
   });
 
   if (!response.ok) {
-    throw new Error(label + " HTTP " + response.status);
+    throw new Error("HTTP " + response.status);
   }
 
-  return response.json();
+  return response.text();
 }
 
-async function fetchFirst(urls, debug, label) {
-  let lastError = null;
-
-  for (const url of urls) {
-    try {
-      const data = await fetchJson(url, debug, label);
-      debug.steps.push({ label, ok: true, url });
-      return data;
-    } catch (error) {
-      lastError = error;
-      debug.steps.push({ label, ok: false, url, error: error.message });
-    }
+function tryJson(text) {
+  try {
+    return JSON.parse(text);
+  } catch (_) {
+    return null;
   }
-
-  throw lastError || new Error(label + " failed");
 }
 
-function assetTypeName(assetTypeId) {
-  const id = Number(assetTypeId);
-  if (id === 2) return "TShirt";
-  if (id === 11) return "Shirt";
-  if (id === 12) return "Pants";
+async function fetchAny(path, debug, label) {
+  const url = joinUrl(PEKORA_BASE_URL, path);
+
+  try {
+    const text = await fetchText(url);
+    debug.steps.push({ label, ok: true, url });
+    return { url, text, json: tryJson(text) };
+  } catch (error) {
+    debug.steps.push({ label, ok: false, url, error: error.message });
+    return null;
+  }
+}
+
+function assetTypeName(value) {
+  const text = String(value || "").toLowerCase();
+  const number = Number(value);
+
+  if (number === 2 || text === "tshirt" || text === "t-shirt") return "TShirt";
+  if (number === 11 || text === "shirt") return "Shirt";
+  if (number === 12 || text === "pants") return "Pants";
+  if (number === 34 || text === "gamepass" || text === "game pass") return "Gamepass";
+
   return null;
 }
 
-function addItem(items, seen, item) {
-  if (!item) return;
+function readId(raw) {
+  return Number(
+    raw.id ||
+    raw.Id ||
+    raw.assetId ||
+    raw.AssetId ||
+    raw.AssetID ||
+    raw.gamepassId ||
+    raw.GamePassId ||
+    raw.GamepassId
+  );
+}
 
-  const id = Number(item.id);
-  const price = Number(item.price);
-  const assetType = String(item.assetType || "");
+function readPrice(raw) {
+  return Number(
+    raw.price ||
+    raw.Price ||
+    raw.robux ||
+    raw.Robux ||
+    raw.PriceInRobux ||
+    raw.priceInRobux ||
+    raw.LowestPrice ||
+    raw.lowestPrice
+  );
+}
 
-  if (!id || !price || price <= 0 || !assetType) return;
-  if (seen[id]) return;
+function readType(raw) {
+  return assetTypeName(
+    raw.assetType ||
+    raw.AssetType ||
+    raw.assetTypeId ||
+    raw.assetTypeID ||
+    raw.AssetTypeId ||
+    raw.AssetTypeID ||
+    raw.type ||
+    raw.Type
+  );
+}
 
-  seen[id] = true;
-  items.push({
+function normalizeItem(raw) {
+  if (!raw || typeof raw !== "object") return null;
+
+  const id = readId(raw);
+  const price = readPrice(raw);
+  const assetType = readType(raw);
+
+  if (!id || !price || price <= 0 || !assetType) return null;
+
+  return {
     id,
-    name: String(item.name || assetType),
+    name: String(raw.name || raw.Name || raw.title || raw.Title || assetType),
     price,
     assetType
-  });
+  };
+}
+
+function addItem(items, seen, item) {
+  if (!item || !item.id || !item.price || !item.assetType) return;
+  if (seen[item.id]) return;
+  seen[item.id] = true;
+  items.push(item);
+}
+
+function collectFromJson(json, items, seen) {
+  if (!json) return;
+
+  const lists = [];
+
+  if (Array.isArray(json)) lists.push(json);
+  if (Array.isArray(json.data)) lists.push(json.data);
+  if (Array.isArray(json.Data)) lists.push(json.Data);
+  if (Array.isArray(json.items)) lists.push(json.items);
+  if (Array.isArray(json.Items)) lists.push(json.Items);
+  if (Array.isArray(json.results)) lists.push(json.results);
+  if (Array.isArray(json.Results)) lists.push(json.Results);
+
+  for (const list of lists) {
+    for (const raw of list) {
+      addItem(items, seen, normalizeItem(raw));
+    }
+  }
+}
+
+function collectIdsFromHtml(html) {
+  const ids = {};
+  const patterns = [
+    /\/catalog\/(\d+)/gi,
+    /\/library\/(\d+)/gi,
+    /assetId=(\d+)/gi,
+    /assetid=(\d+)/gi,
+    /data-asset-id=["']?(\d+)/gi,
+    /data-item-id=["']?(\d+)/gi
+  ];
+
+  for (const pattern of patterns) {
+    let match;
+    while ((match = pattern.exec(html)) !== null) {
+      ids[Number(match[1])] = true;
+    }
+  }
+
+  return Object.keys(ids).map(Number);
 }
 
 async function getUser(userId, debug) {
-  const id = encodeURIComponent(String(userId));
-  const data = await fetchFirst([
-    "https://users.roblox.com/v1/users/" + id,
-    "https://users.roproxy.com/v1/users/" + id
-  ], debug, "user");
+  const paths = [
+    "/api/users/" + encodeURIComponent(userId),
+    "/users/" + encodeURIComponent(userId),
+    "/users/" + encodeURIComponent(userId) + "/profile"
+  ];
+
+  for (const path of paths) {
+    const result = await fetchAny(path, debug, "user");
+    if (!result) continue;
+
+    if (result.json) {
+      const name = result.json.username || result.json.Username || result.json.name || result.json.Name;
+      const displayName = result.json.displayName || result.json.DisplayName || name;
+      if (name) {
+        return {
+          id: Number(userId),
+          name: String(name),
+          displayName: String(displayName || name)
+        };
+      }
+    }
+
+    const titleMatch = result.text.match(/<title[^>]*>([^<]+)/i);
+    const nameMatch = result.text.match(/class=["'][^"']*(username|profile-name)[^"']*["'][^>]*>([^<]+)/i);
+    if (nameMatch || titleMatch) {
+      const name = String((nameMatch && nameMatch[2]) || titleMatch[1]).replace(/\s*-\s*.*/, "").trim();
+      if (name) {
+        return {
+          id: Number(userId),
+          name,
+          displayName: name
+        };
+      }
+    }
+  }
 
   return {
-    id: Number(data.id || userId),
-    name: String(data.name || userId),
-    displayName: String(data.displayName || data.name || userId)
+    id: Number(userId),
+    name: String(userId),
+    displayName: String(userId)
   };
-}
-
-async function getUserGames(userId, debug) {
-  const games = [];
-  const seen = {};
-  const filters = ["2", "Public"];
-
-  for (const filter of filters) {
-    let cursor = "";
-
-    for (let page = 0; page < 5; page++) {
-      let path = "/v2/users/" + encodeURIComponent(String(userId))
-        + "/games?accessFilter=" + encodeURIComponent(filter)
-        + "&sortOrder=Asc&limit=50";
-
-      if (cursor) {
-        path += "&cursor=" + encodeURIComponent(cursor);
-      }
-
-      const data = await fetchFirst([
-        "https://games.roblox.com" + path,
-        "https://games.roproxy.com" + path
-      ], debug, "user-games");
-
-      for (const game of data.data || []) {
-        const universeId = Number(game.id || game.universeId);
-        if (universeId && !seen[universeId]) {
-          seen[universeId] = true;
-          games.push(universeId);
-        }
-      }
-
-      cursor = data.nextPageCursor;
-      if (!cursor) break;
-    }
-
-    if (games.length > 0) break;
-  }
-
-  debug.gamesFound = games.length;
-  return games;
-}
-
-async function getGamepassesForUniverse(universeId, debug) {
-  const result = [];
-  let cursor = "";
-
-  for (let page = 0; page < 5; page++) {
-    let path = "/v1/games/" + encodeURIComponent(String(universeId))
-      + "/game-passes?limit=100&sortOrder=Asc";
-
-    if (cursor) {
-      path += "&cursor=" + encodeURIComponent(cursor);
-    }
-
-    const data = await fetchFirst([
-      "https://games.roblox.com" + path,
-      "https://games.roproxy.com" + path
-    ], debug, "game-passes");
-
-    for (const pass of data.data || []) {
-      addItem(result, {}, {
-        id: pass.id,
-        name: pass.name || "Gamepass",
-        price: pass.price,
-        assetType: "Gamepass"
-      });
-    }
-
-    cursor = data.nextPageCursor;
-    if (!cursor) break;
-  }
-
-  return result;
 }
 
 async function getProductInfo(assetId, debug) {
-  const id = encodeURIComponent(String(assetId));
-  return fetchFirst([
-    "https://api.roblox.com/marketplace/productinfo?assetId=" + id,
-    "https://api.roproxy.com/marketplace/productinfo?assetId=" + id
-  ], debug, "product-info");
-}
-
-async function getClothingByCreator(username, debug) {
-  const result = [];
-  const creator = encodeURIComponent(username);
-  const urls = [
-    "https://catalog.roblox.com/v1/search/items?category=Clothing&creatorName=" + creator + "&creatorType=User&salesTypeFilter=1&limit=100",
-    "https://catalog.roblox.com/v1/search/items?Category=3&CreatorName=" + creator + "&CreatorType=User&SalesTypeFilter=1&Limit=100",
-    "https://catalog.roproxy.com/v1/search/items?category=Clothing&creatorName=" + creator + "&creatorType=User&salesTypeFilter=1&limit=100",
-    "https://catalog.roproxy.com/v1/search/items?Category=3&CreatorName=" + creator + "&CreatorType=User&SalesTypeFilter=1&Limit=100"
+  const paths = [
+    "/marketplace/productinfo?assetId=" + encodeURIComponent(assetId),
+    "/api/marketplace/productinfo?assetId=" + encodeURIComponent(assetId),
+    "/v1/marketplace/productinfo?assetId=" + encodeURIComponent(assetId),
+    "/catalog/" + encodeURIComponent(assetId)
   ];
 
-  let data = null;
-  for (const url of urls) {
-    try {
-      data = await fetchJson(url, debug, "catalog");
-      debug.steps.push({ label: "catalog", ok: true, url });
-      break;
-    } catch (error) {
-      debug.steps.push({ label: "catalog", ok: false, url, error: error.message });
+  for (const path of paths) {
+    const result = await fetchAny(path, debug, "product-info");
+    if (!result) continue;
+
+    if (result.json) {
+      const item = normalizeItem(result.json);
+      if (item) return item;
+    }
+
+    const priceMatch = result.text.match(/(?:R\$|Robux|Price)[^\d]{0,20}(\d+)/i);
+    const nameMatch = result.text.match(/<title[^>]*>([^<]+)/i);
+    const typeMatch = result.text.match(/(Gamepass|Game Pass|T-Shirt|TShirt|Shirt|Pants)/i);
+    const assetType = typeMatch && assetTypeName(typeMatch[1]);
+    const price = priceMatch && Number(priceMatch[1]);
+
+    if (assetType && price && price > 0) {
+      return {
+        id: Number(assetId),
+        name: String(nameMatch ? nameMatch[1] : assetType).replace(/\s*-\s*.*/, "").trim(),
+        price,
+        assetType
+      };
     }
   }
 
-  if (!data || !data.data) {
-    debug.clothingFound = 0;
-    return result;
-  }
+  return null;
+}
 
-  for (const item of data.data) {
-    const directType = assetTypeName(item.assetType || item.assetTypeId);
-    const directPrice = Number(item.price || item.lowestPrice || 0);
+async function getItemsByCreator(user, debug) {
+  const items = [];
+  const seen = {};
+  const id = encodeURIComponent(user.id);
+  const name = encodeURIComponent(user.name);
 
-    if (item.id && directType && directPrice > 0) {
-      result.push({
-        id: item.id,
-        name: item.name || directType,
-        price: directPrice,
-        assetType: directType
-      });
-      continue;
-    }
+  const paths = [
+    "/catalog/json?CreatorID=" + id,
+    "/catalog/json?creatorId=" + id,
+    "/catalog/json?CreatorName=" + name,
+    "/catalog/json?creatorName=" + name,
+    "/catalog?CreatorID=" + id,
+    "/catalog?creatorId=" + id,
+    "/catalog?CreatorName=" + name,
+    "/catalog?creatorName=" + name,
+    "/users/" + id + "/inventory",
+    "/users/" + id + "/creations",
+    "/users/" + id + "/profile"
+  ];
 
-    if (!item.id) continue;
+  for (const path of paths) {
+    const result = await fetchAny(path, debug, "creator-items");
+    if (!result) continue;
 
-    try {
-      const info = await getProductInfo(item.id, debug);
-      const detailedType = assetTypeName(info.AssetTypeId || info.assetTypeId);
-      const detailedPrice = Number(info.PriceInRobux || info.price || 0);
+    collectFromJson(result.json, items, seen);
 
-      if (detailedType && detailedPrice > 0 && info.IsForSale !== false) {
-        result.push({
-          id: info.AssetId || item.id,
-          name: info.Name || item.name || detailedType,
-          price: detailedPrice,
-          assetType: detailedType
-        });
+    if (items.length === 0 && result.text) {
+      const ids = collectIdsFromHtml(result.text);
+      for (const assetId of ids.slice(0, 80)) {
+        const item = await getProductInfo(assetId, debug);
+        addItem(items, seen, item);
       }
-    } catch (error) {
-      debug.steps.push({
-        label: "product-info-skip",
-        ok: false,
-        id: item.id,
-        error: error.message
-      });
     }
   }
 
-  debug.clothingFound = result.length;
-  return result;
+  return items;
 }
 
 async function buildItems(userId, debugMode) {
-  const cacheKey = "user:" + userId;
-  const cached = getFromCache(cacheKey);
+  const key = "items:" + userId;
+  const cached = cacheGet(key);
   if (cached && !debugMode) return cached;
 
   const debug = {
+    baseUrl: PEKORA_BASE_URL,
     userId: Number(userId),
-    steps: [],
-    gamesFound: 0,
-    gamepassesFound: 0,
-    clothingFound: 0
+    steps: []
   };
 
   const user = await getUser(userId, debug);
-  const items = [];
-  const seen = {};
-
-  try {
-    const games = await getUserGames(user.id, debug);
-    for (const universeId of games) {
-      try {
-        const passes = await getGamepassesForUniverse(universeId, debug);
-        debug.gamepassesFound += passes.length;
-        for (const pass of passes) {
-          addItem(items, seen, pass);
-        }
-      } catch (error) {
-        debug.steps.push({
-          label: "game-passes-universe-failed",
-          ok: false,
-          universeId,
-          error: error.message
-        });
-      }
-    }
-  } catch (error) {
-    debug.steps.push({ label: "all-game-passes-failed", ok: false, error: error.message });
-  }
-
-  try {
-    const clothing = await getClothingByCreator(user.name, debug);
-    for (const item of clothing) {
-      addItem(items, seen, item);
-    }
-  } catch (error) {
-    debug.steps.push({ label: "all-clothing-failed", ok: false, error: error.message });
-  }
+  const items = await getItemsByCreator(user, debug);
 
   items.sort((a, b) => {
     if (a.price === b.price) return a.name.localeCompare(b.name);
@@ -313,47 +328,37 @@ async function buildItems(userId, debugMode) {
   if (debugMode) {
     result.debug = debug;
   } else {
-    setCache(cacheKey, result);
+    cacheSet(key, result);
   }
 
   return result;
 }
 
 app.get("/", (req, res) => {
-  res.type("text/plain").send("MAINTIPS auto booth proxy is running");
+  res.type("text/plain").send("MAINTIPS Pekora booth proxy is running");
 });
 
 app.get("/health", (req, res) => {
-  res.json({ ok: true, time: new Date().toISOString() });
+  res.json({ ok: true, baseUrl: PEKORA_BASE_URL, time: new Date().toISOString() });
 });
 
 app.get("/items/:userId", async (req, res) => {
   try {
-    const result = await buildItems(req.params.userId, false);
-    res.json(result);
+    res.json(await buildItems(req.params.userId, false));
   } catch (error) {
-    res.status(500).json({
-      ok: false,
-      error: error.message,
-      items: []
-    });
+    res.status(500).json({ ok: false, error: error.message, items: [] });
   }
 });
 
 app.get("/debug/:userId", async (req, res) => {
   try {
-    const result = await buildItems(req.params.userId, true);
-    res.json(result);
+    res.json(await buildItems(req.params.userId, true));
   } catch (error) {
-    res.status(500).json({
-      ok: false,
-      error: error.message,
-      items: []
-    });
+    res.status(500).json({ ok: false, error: error.message, items: [] });
   }
 });
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
-  console.log("MAINTIPS auto booth proxy running on port " + port);
+  console.log("MAINTIPS Pekora booth proxy running on port " + port);
 });
