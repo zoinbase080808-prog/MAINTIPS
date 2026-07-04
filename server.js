@@ -157,7 +157,7 @@ async function getGamepassesForUniverse(universeId, debug) {
     ], debug, "game-passes");
 
     for (const pass of data.data || []) {
-      result.push({
+      addItem(result, {}, {
         id: pass.id,
         name: pass.name || "Gamepass",
         price: pass.price,
@@ -183,7 +183,6 @@ async function getProductInfo(assetId, debug) {
 async function getClothingByCreator(username, debug) {
   const result = [];
   const creator = encodeURIComponent(username);
-
   const urls = [
     "https://catalog.roblox.com/v1/search/items?category=Clothing&creatorName=" + creator + "&creatorType=User&salesTypeFilter=1&limit=100",
     "https://catalog.roblox.com/v1/search/items?Category=3&CreatorName=" + creator + "&CreatorType=User&SalesTypeFilter=1&Limit=100",
@@ -269,7 +268,6 @@ async function buildItems(userId, debugMode) {
 
   try {
     const games = await getUserGames(user.id, debug);
-
     for (const universeId of games) {
       try {
         const passes = await getGamepassesForUniverse(universeId, debug);
