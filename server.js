@@ -4,6 +4,17 @@ const app = express();
 const cache = new Map();
 const CACHE_MS = 120000;
 
+const MANUAL_ITEMS = {
+  users: {
+    // Example:
+    // "145772": {
+    //   items: [
+    //     { id: 123456789, name: "10 Robux", price: 10, assetType: "Gamepass" }
+    //   ]
+    // }
+  }
+};
+
 app.use(express.json({ limit: "1mb" }));
 
 function cacheGet(key) {
@@ -35,6 +46,27 @@ async function getJson(url) {
   return response.json();
 }
 
+async function getJsonFirst(urls, debug, label) {
+  let lastError = null;
+
+  for (const url of urls) {
+    try {
+      const data = await getJson(url);
+      if (debug) {
+        debug.steps.push({ label, url, ok: true });
+      }
+      return data;
+    } catch (error) {
+      lastError = error;
+      if (debug) {
+        debug.steps.push({ label, url, ok: false, error: error.message });
+      }
+    }
+  }
+
+  throw lastError || new Error("All URLs failed for " + label);
+}
+
 function normalizeAssetType(assetTypeId) {
   if (assetTypeId === 2) return "TShirt";
   if (assetTypeId === 11) return "Shirt";
@@ -49,8 +81,13 @@ function addUnique(items, seen, item) {
   items.push(item);
 }
 
-async function getUser(userId) {
-  const data = await getJson("https://users.roblox.com/v1/users/" + encodeURIComponent(userId));
+async function getUser(userId, debug) {
+  const encoded = encodeURIComponent(userId);
+  const data = await getJsonFirst([
+    "https://users.roblox.com/v1/users/" + encoded,
+    "https://users.roproxy.com/v1/users/" + encoded
+  ], debug, "user");
+
   return {
     id: data.id || Number(userId),
     name: data.name || String(userId),
@@ -58,7 +95,7 @@ async function getUser(userId) {
   };
 }
 
-async function getUserGames(userId) {
+async function getUserGames(userId, debug) {
   const games = [];
   const seen = {};
   const filters = ["2", "Public"];
@@ -67,13 +104,17 @@ async function getUserGames(userId) {
     let cursor = "";
 
     for (let page = 0; page < 3; page++) {
-      let url = "https://games.roblox.com/v2/users/" + encodeURIComponent(userId)
+      let path = "/v2/users/" + encodeURIComponent(userId)
         + "/games?accessFilter=" + filter
         + "&sortOrder=Asc&limit=50";
 
-      if (cursor) url += "&cursor=" + encodeURIComponent(cursor);
+      if (cursor) path += "&cursor=" + encodeURIComponent(cursor);
 
-      const data = await getJson(url);
+      const data = await getJsonFirst([
+        "https://games.roblox.com" + path,
+        "https://games.roproxy.com" + path
+      ], debug, "games");
+
       const list = data.data || [];
 
       for (const game of list) {
@@ -94,17 +135,21 @@ async function getUserGames(userId) {
   return games;
 }
 
-async function getGamepasses(universeId) {
+async function getGamepasses(universeId, debug) {
   const items = [];
   let cursor = "";
 
   for (let page = 0; page < 3; page++) {
-    let url = "https://games.roblox.com/v1/games/" + encodeURIComponent(universeId)
+    let path = "/v1/games/" + encodeURIComponent(universeId)
       + "/game-passes?limit=100&sortOrder=Asc";
 
-    if (cursor) url += "&cursor=" + encodeURIComponent(cursor);
+    if (cursor) path += "&cursor=" + encodeURIComponent(cursor);
 
-    const data = await getJson(url);
+    const data = await getJsonFirst([
+      "https://games.roblox.com" + path,
+      "https://games.roproxy.com" + path
+    ], debug, "gamepasses");
+
     const list = data.data || [];
 
     for (const pass of list) {
@@ -125,15 +170,27 @@ async function getGamepasses(universeId) {
   return items;
 }
 
-async function getCatalogItems(username) {
+async function getProductInfo(assetId, debug) {
+  const encoded = encodeURIComponent(assetId);
+  return getJsonFirst([
+    "https://api.roblox.com/marketplace/productinfo?assetId=" + encoded,
+    "https://api.roproxy.com/marketplace/productinfo?assetId=" + encoded
+  ], debug, "productinfo");
+}
+
+async function getCatalogItems(username, debug) {
   const items = [];
-  const url = "https://catalog.roblox.com/v1/search/items"
+  const path = "/v1/search/items"
     + "?creatorName=" + encodeURIComponent(username)
     + "&creatorType=User"
     + "&salesTypeFilter=1"
     + "&limit=100";
 
-  const data = await getJson(url);
+  const data = await getJsonFirst([
+    "https://catalog.roblox.com" + path,
+    "https://catalog.roproxy.com" + path
+  ], debug, "catalog");
+
   const list = data.data || [];
 
   for (const item of list) {
@@ -145,36 +202,90 @@ async function getCatalogItems(username) {
         price: item.price,
         assetType
       });
+    } else if (item.id) {
+      try {
+        const info = await getProductInfo(item.id, debug);
+        const detailedType = normalizeAssetType(info.AssetTypeId || info.assetTypeId);
+        const price = info.PriceInRobux || info.price;
+        if (detailedType && price) {
+          items.push({
+            id: info.AssetId || item.id,
+            name: info.Name || item.name || detailedType,
+            price,
+            assetType: detailedType
+          });
+        }
+      } catch (error) {
+        if (debug) {
+          debug.steps.push({ label: "productinfo-skip", id: item.id, ok: false, error: error.message });
+        }
+      }
     }
   }
 
   return items;
 }
 
-async function buildDonationItems(userId) {
+function getManualItems(userId, username) {
+  const lists = [];
+  const userKey = String(userId);
+
+  if (MANUAL_ITEMS.users[userKey]) lists.push(MANUAL_ITEMS.users[userKey]);
+  if (username && MANUAL_ITEMS.users[username]) lists.push(MANUAL_ITEMS.users[username]);
+
+  const items = [];
+  for (const list of lists) {
+    for (const item of (list.items || [])) {
+      if (item.id && item.price && item.assetType) {
+        items.push({
+          id: Number(item.id),
+          name: String(item.name || item.assetType),
+          price: Number(item.price),
+          assetType: String(item.assetType)
+        });
+      }
+    }
+  }
+  return items;
+}
+
+async function buildDonationItems(userId, withDebug = false) {
   const cacheKey = "items:" + userId;
   const cached = cacheGet(cacheKey);
-  if (cached) return cached;
+  if (cached && !withDebug) return cached;
 
-  const user = await getUser(userId);
+  const debug = { steps: [] };
+  const user = await getUser(userId, debug);
   const items = [];
   const seen = {};
 
   try {
-    const games = await getUserGames(user.id);
+    const games = await getUserGames(user.id, debug);
+    debug.gamesFound = games.length;
+
     for (const universeId of games) {
-      const passes = await getGamepasses(universeId);
+      const passes = await getGamepasses(universeId, debug);
       for (const item of passes) addUnique(items, seen, item);
     }
   } catch (error) {
     console.warn("[passes]", error.message);
+    debug.passesError = error.message;
   }
 
   try {
-    const clothes = await getCatalogItems(user.name);
+    const clothes = await getCatalogItems(user.name, debug);
+    debug.clothingFound = clothes.length;
+
     for (const item of clothes) addUnique(items, seen, item);
   } catch (error) {
     console.warn("[catalog]", error.message);
+    debug.catalogError = error.message;
+  }
+
+  const manual = getManualItems(user.id, user.name);
+  debug.manualFound = manual.length;
+  for (const item of manual) {
+    addUnique(items, seen, item);
   }
 
   items.sort((a, b) => {
@@ -190,7 +301,12 @@ async function buildDonationItems(userId) {
     items
   };
 
-  cacheSet(cacheKey, result);
+  if (withDebug) {
+    result.debug = debug;
+  } else {
+    cacheSet(cacheKey, result);
+  }
+
   return result;
 }
 
@@ -205,6 +321,19 @@ app.get("/health", (req, res) => {
 app.get("/items/:userId", async (req, res) => {
   try {
     const result = await buildDonationItems(req.params.userId);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      error: error.message,
+      items: []
+    });
+  }
+});
+
+app.get("/debug/:userId", async (req, res) => {
+  try {
+    const result = await buildDonationItems(req.params.userId, true);
     res.json(result);
   } catch (error) {
     res.status(500).json({
